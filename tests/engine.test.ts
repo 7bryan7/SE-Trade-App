@@ -1,0 +1,21 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { emptyAccount, fund, openPosition, closePosition, pnl, parseAccount } from '../src/engine.ts';
+import { parseRates, rate, usable } from '../src/market.ts';
+import type { Day } from '../src/market.ts';
+// These fixed inputs are isolated test fixtures; the application never imports them.
+const day: Day = { date: new Date().toISOString().slice(0,10), rates: { USD:1, EUR:0.8, GBP:0.5, JPY:100, CHF:0.9, AUD:1.5, CAD:1.3 } };
+const near = (a: number,b: number) => assert.ok(Math.abs(a-b)<1e-8, `${a} != ${b}`);
+test('new account has no seeded balance, positions or activity', () => assert.deepEqual(emptyAccount(), { version:1,cash:0,positions:[],events:[] }));
+test('virtual funding accepts decimal cents and persists without rounding away cents', () => { const a=fund(emptyAccount(),0.29); near(a.cash,0.29);assert.deepEqual(parseAccount(JSON.stringify(a)),a); });
+test('invalid funding and fractional cents are rejected', () => { for(const n of [NaN,Infinity,0,-1,0.001,1000001]) assert.throws(() => fund(emptyAccount(),n)); });
+test('opening reserves full USD notional, closing at same price preserves equity', () => { const a=fund(emptyAccount(),10000); const b=openPosition(a,'EUR/USD','buy',1000,day); near(b.cash,8750);near(b.positions[0].collateral,1250);const c=closePosition(b,b.positions[0].id,day);near(c.cash,10000);assert.equal(c.positions.length,0);assert.equal(c.events[0].pnl,0);assert.equal(c.events.length,3); });
+test('buy and sell P/L have opposite signs and quote currency is converted to USD', () => { const a=fund(emptyAccount(),10000);const long=openPosition(a,'GBP/JPY','buy',10,day);const short=openPosition(a,'GBP/JPY','sell',10,day);const newer={...day,rates:{...day.rates,JPY:110}};near(pnl(long.positions[0],newer),200/110);near(pnl(short.positions[0],newer),-200/110); });
+test('USD/JPY collateral is base notional in USD, not JPY amount', () => {const a=openPosition(fund(emptyAccount(),5000),'USD/JPY','buy',1000,day);near(a.cash,4000);near(a.positions[0].collateral,1000);});
+test('insufficient funds and invalid quantities are rejected without state mutation', () => {const a=fund(emptyAccount(),10);for(const n of [0,-1,NaN,Infinity,1e10,1000]) assert.throws(() => openPosition(a,'EUR/USD','buy',n,day));near(a.cash,10);assert.equal(a.positions.length,0);});
+test('duplicate close cannot credit proceeds twice', () => {const a=openPosition(fund(emptyAccount(),10000),'EUR/USD','buy',1,day);const id=a.positions[0].id;const b=closePosition(a,id,day);assert.throws(() => closePosition(b,id,day));});
+test('closed P/L is correctly returned into available cash', () => {const a=openPosition(fund(emptyAccount(),10000),'EUR/USD','buy',1000,day);const newer={...day,rates:{...day.rates,EUR:1/1.3}};const c=closePosition(a,a.positions[0].id,newer);near(c.cash,10050);near(c.events[0].pnl!,50);});
+test('cross pair rates use the same USD reference set', () => {near(rate(day,'EUR/GBP'),0.625);near(rate(day,'GBP/JPY'),200);});
+test('provider rows require two complete dates and ignore bad or incomplete rows', () => {const rows=[day,{...day,date:'2026-01-01'}].flatMap(d=>Object.entries(d.rates).filter(([c])=>c!=='USD').map(([quote,r])=>({date:d.date,base:'USD',quote,rate:r})));rows.push({date:'2026-01-02',base:'USD',quote:'EUR',rate:0});const parsed=parseRates(rows);assert.equal(parsed.length,2);assert.throws(()=>parseRates([]));assert.throws(()=>parseRates({}));assert.throws(()=>parseRates([{date:day.date,base:'USD',quote:'EUR',rate:1}]));});
+test('old or expired fetch data cannot be traded', () => {const now=Date.now();const m={days:[day],receivedAt:now,endpoint:''};assert.ok(usable(m));assert.equal(usable({...m,receivedAt:now-21*60000}),false);assert.equal(usable({...m,days:[{...day,date:'2000-01-01'}]}),false);assert.equal(usable(null),false);});
+test('corrupt local storage data is rejected rather than silently replaced', () => {for(const s of ['invalid','null','{}','{"version":1,"cash":"100","positions":[],"events":[]}']) assert.throws(()=>parseAccount(s));const a=openPosition(fund(emptyAccount(),1000),'EUR/USD','buy',1,day);const b={...a,positions:[a.positions[0],a.positions[0]]};assert.throws(()=>parseAccount(JSON.stringify(b)));});
